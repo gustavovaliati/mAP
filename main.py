@@ -28,7 +28,7 @@ if args.set_class_iou is not None:
 
 # if there are no images then no animation can be shown
 img_path = 'images'
-if os.path.exists(img_path): 
+if os.path.exists(img_path):
   for dirpath, dirnames, files in os.walk(img_path):
     if not files:
       # no image files found
@@ -50,6 +50,8 @@ if not args.no_animation:
 draw_plot = False
 if not args.no_plot:
   try:
+    import matplotlib
+    matplotlib.use('agg')
     import matplotlib.pyplot as plt
     draw_plot = True
   except ImportError:
@@ -181,7 +183,7 @@ def draw_plot_func(dictionary, n_classes, window_title, plot_title, x_label, out
   sorted_dic_by_value = sorted(dictionary.items(), key=operator.itemgetter(1))
   # unpacking the list of tuples into two lists
   sorted_keys, sorted_values = zip(*sorted_dic_by_value)
-  # 
+  #
   if true_p_bar != "":
     """
      Special case to draw in (green=true predictions) & (red=false predictions)
@@ -241,7 +243,7 @@ def draw_plot_func(dictionary, n_classes, window_title, plot_title, x_label, out
   dpi = fig.dpi
   height_pt = n_classes * (tick_font_size * 1.4) # 1.4 (some spacing)
   height_in = height_pt / dpi
-  # compute the required figure height 
+  # compute the required figure height
   top_margin = 0.15    # in percentage of the figure height
   bottom_margin = 0.05 # in percentage of the figure height
   figure_height = height_in / (1 - top_margin - bottom_margin)
@@ -280,6 +282,28 @@ if draw_plot:
   os.makedirs(results_files_path + "/classes")
 if show_animation:
   os.makedirs(results_files_path + "/images")
+
+hist_gt_areas = [] #areas of each gt bbox
+hist_tp_gt_areas = [] #areas of each gt bbox marked as tp
+hist_tp_pred_areas = [] #areas of each pred bbox marked as tp
+
+hist_gt_height = [] #height of each gt bbox
+hist_tp_gt_height = [] #height of each gt bbox marked as tp
+hist_tp_pred_height = [] #height of each pred bbox marked as tp
+
+"""
+Calculate area of a given bbox
+"""
+def bbox_area(obj_bbox):
+    bbox = [ float(x) for x in obj_bbox.split() ]
+    return (bbox[2] - bbox[0] + 1) * (bbox[3] - bbox[1] + 1)
+
+"""
+Calculate the height of a given bbox
+"""
+def bbox_height(obj_bbox):
+    bbox = [ float(x) for x in obj_bbox.split() ]
+    return (bbox[3] - bbox[1] + 1)
 
 """
  Ground-Truth
@@ -330,6 +354,8 @@ for txt_file in ground_truth_files_list:
         is_difficult = False
     else:
         bounding_boxes.append({"class_name":class_name, "bbox":bbox, "used":False})
+        hist_gt_areas.append(bbox_area(bbox))
+        hist_gt_height.append(bbox_height(bbox))
         # count that object
         if class_name in gt_counter_per_class:
           gt_counter_per_class[class_name] += 1
@@ -415,6 +441,7 @@ for class_index, class_name in enumerate(gt_classes):
 """
 sum_AP = 0.0
 ap_dictionary = {}
+
 # open file to store the results
 with open(results_files_path + "/results.txt", 'w') as results_file:
   results_file.write("# AP and precision/recall per class\n")
@@ -491,6 +518,10 @@ with open(results_files_path + "/results.txt", 'w') as results_file:
               tp[idx] = 1
               gt_match["used"] = True
               count_true_positives[class_name] += 1
+              hist_tp_gt_areas.append(bbox_area(gt_match["bbox"]))
+              hist_tp_gt_height.append(bbox_height(gt_match["bbox"]))
+              hist_tp_pred_areas.append(bbox_area(prediction["bbox"]))
+              hist_tp_pred_height.append(bbox_height(prediction["bbox"]))
               # update the ".json" file
               with open(gt_file, 'w') as f:
                   f.write(json.dumps(ground_truth_data))
@@ -618,6 +649,16 @@ with open(results_files_path + "/results.txt", 'w') as results_file:
       #plt.show()
       # save the plot
       fig.savefig(results_files_path + "/classes/" + class_name + ".png")
+      plt.cla() # clear axes for next plot
+
+      # print(len(fp),len(tp))
+      plt.plot([0, 1], [0, 1], 'k--')
+      plt.plot(fp, tp)
+      plt.xlabel('False positive rate')
+      plt.ylabel('True positive rate')
+      plt.title('ROC curve')
+      plt.legend(loc='best')
+      fig.savefig(results_files_path + "/test_grv_" + class_name + ".png")
       plt.cla() # clear axes for next plot
 
   if show_animation:
@@ -757,3 +798,129 @@ if draw_plot:
     plot_color,
     ""
     )
+
+"""
+Plot the histograms of bbox areas by GT and TP
+"""
+if draw_plot:
+    """
+    Histogram: GT x TP
+    This will reveal in which bbox sizes (areas) it is more problematic to detect.
+    """
+    import numpy as np
+
+    plt.title('GT x TP bbox areas. BINS=auto')
+    plt.xlim(0, 60000)
+    _, bins, _ = plt.hist(hist_gt_areas, bins='auto', label='GT {}'.format(len(hist_gt_areas)))
+    plt.hist(hist_tp_gt_areas, facecolor='green', bins=bins, alpha=0.5, label='TP {}'.format(len(hist_tp_gt_areas)))
+    plt.grid(True)
+    plt.xticks(bins,rotation=90)
+    plt.tick_params(axis='both', which='major', labelsize=4)
+    plt.legend(loc='upper right')
+    plt.ylabel('# bboxes')
+    plt.xlabel('bbox area')
+    plt.savefig(os.path.join(results_files_path,'hist_area_gt_tp_binsauto.jpg'),dpi = 300)
+    plt.cla()
+
+    n_bins = 50
+    plt.title('GT x TP bbox areas. BINS={}'.format(n_bins))
+    plt.xlim(0, 60000)
+    _, bins, _ = plt.hist(hist_gt_areas, bins=n_bins, label='GT {}'.format(len(hist_gt_areas)))
+    plt.hist(hist_tp_gt_areas, facecolor='green', bins=bins, alpha=0.5, label='TP {}'.format(len(hist_tp_gt_areas)))
+    plt.grid(True)
+    plt.xticks(bins,rotation=90)
+    plt.tick_params(axis='both', which='major', labelsize=6)
+    plt.legend(loc='upper right')
+    plt.ylabel('# bboxes')
+    plt.xlabel('bbox area')
+    plt.savefig(os.path.join(results_files_path,'hist_area_gt_tp_bins-manual.jpg'),dpi = 600)
+    plt.cla()
+
+    less2k_hist_gt_areas = [i for i in hist_gt_areas if i <= 2000]
+    less2k_hist_tp_gt_areas = [i for i in hist_tp_gt_areas if i <= 2000]
+    n_bins = 50
+    plt.title('GT x TP bbox areas. BINS={}. Zoom <= 2k.'.format(n_bins))
+    _, bins, _ = plt.hist(less2k_hist_gt_areas, bins=n_bins, label='GT {}'.format(len(less2k_hist_gt_areas)))
+    plt.hist(less2k_hist_tp_gt_areas, facecolor='green', bins=bins, alpha=0.5, label='TP {}'.format(len(less2k_hist_tp_gt_areas)))
+    plt.grid(True)
+    plt.xticks(bins,rotation=90)
+    plt.tick_params(axis='both', which='major', labelsize=6)
+    plt.legend(loc='upper right')
+    plt.ylabel('# bboxes')
+    plt.xlabel('bbox area')
+    plt.savefig(os.path.join(results_files_path,'hist_area_gt_tp_zoom_bins-manual.jpg'),dpi = 600)
+    plt.cla()
+
+    n_bins = 50
+    plt.title('GT x TP-Predictions bbox areas. BINS={}'.format(n_bins))
+    plt.xlim(0, 60000)
+    _, bins, _ = plt.hist(hist_gt_areas, bins=n_bins, label='GT {}'.format(len(hist_gt_areas)))
+    plt.hist(hist_tp_pred_areas, facecolor='pink', bins=bins, alpha=0.5, label='TP {}'.format(len(hist_tp_pred_areas)))
+    plt.grid(True)
+    plt.xticks(bins,rotation=90)
+    plt.tick_params(axis='both', which='major', labelsize=6)
+    plt.legend(loc='upper right')
+    plt.ylabel('# bboxes')
+    plt.xlabel('bbox area')
+    plt.savefig(os.path.join(results_files_path,'hist_area_gt_tp-pred_bins-manual.jpg'),dpi = 600)
+    plt.cla()
+
+
+
+    """
+    Histogram: GT HEIGHTS x TP HEIGHTS
+    This will reveal in which PEDESTRIAN HEIGHTS it is more problematic to detect.
+    """
+
+    plt.title('GT x TP bbox heights. BINS=auto')
+    _, bins, _ = plt.hist(hist_gt_height, bins='auto', label='GT {}'.format(len(hist_gt_height)))
+    plt.hist(hist_tp_gt_height, facecolor='green', bins=bins, alpha=0.5, label='TP {}'.format(len(hist_tp_gt_height)))
+    plt.grid(True)
+    plt.xticks(bins,rotation=90)
+    plt.tick_params(axis='both', which='major', labelsize=6)
+    plt.legend(loc='upper right')
+    plt.ylabel('# bboxes')
+    plt.xlabel('bbox height')
+    plt.savefig(os.path.join(results_files_path,'hist_height_gt_tp_bins-auto.jpg'),dpi = 300)
+    plt.cla()
+
+    n_bins = 50
+    plt.title('GT x TP bbox heights. BINS={}'.format(n_bins))
+    _, bins, _ = plt.hist(hist_gt_height, bins=n_bins, label='GT {}'.format(len(hist_gt_height)))
+    plt.hist(hist_tp_gt_height, facecolor='green', bins=bins, alpha=0.5, label='TP {}'.format(len(hist_tp_gt_height)))
+    plt.grid(True)
+    plt.xticks(bins,rotation=90)
+    plt.tick_params(axis='both', which='major', labelsize=6)
+    plt.legend(loc='upper right')
+    plt.ylabel('# bboxes')
+    plt.xlabel('bbox height')
+    plt.savefig(os.path.join(results_files_path,'hist_height_gt_tp_bins-manual.jpg'),dpi = 600)
+    plt.cla()
+
+    less2k_hist_gt_height = [i for i in hist_gt_height if i <= 2000]
+    less2k_hist_tp_gt_height = [i for i in hist_tp_gt_height if i <= 2000]
+    n_bins = 50
+    plt.title('GT x TP bbox heights. Zoom <= 2k. BINS={}'.format(n_bins))
+    _, bins, _ = plt.hist(less2k_hist_gt_height, bins=n_bins, label='GT {}'.format(len(less2k_hist_gt_height)))
+    plt.hist(less2k_hist_tp_gt_height, facecolor='green', bins=bins, alpha=0.5, label='TP {}'.format(len(less2k_hist_tp_gt_height)))
+    plt.grid(True)
+    plt.xticks(bins,rotation=90)
+    plt.tick_params(axis='both', which='major', labelsize=6)
+    plt.legend(loc='upper right')
+    plt.ylabel('# bboxes')
+    plt.xlabel('bbox height')
+    plt.savefig(os.path.join(results_files_path,'hist_height_gt_tp_zoom_bins-manual.jpg'),dpi = 600)
+    plt.cla()
+
+    n_bins = 50
+    plt.title('GT x TP-Predictions bbox heights. BINS={}'.format(n_bins))
+    _, bins, _ = plt.hist(hist_gt_height, bins=n_bins, label='GT {}'.format(len(hist_gt_height)))
+    plt.hist(hist_tp_pred_height, facecolor='pink', bins=bins, alpha=0.5, label='TP-Pred {}'.format(len(hist_tp_pred_height)))
+    plt.grid(True)
+    plt.xticks(bins,rotation=90)
+    plt.tick_params(axis='both', which='major', labelsize=6)
+    plt.legend(loc='upper right')
+    plt.ylabel('# bboxes')
+    plt.xlabel('bbox height')
+    plt.savefig(os.path.join(results_files_path,'hist_height_gt_tp-pred_bins-manual.jpg'),dpi = 600)
+    plt.cla()
