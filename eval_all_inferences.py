@@ -6,17 +6,26 @@ import operator
 import sys
 import argparse
 import datetime
+import math
+import re
 
 parser = argparse.ArgumentParser()
 parser.add_argument('-i', '--inference_dir', help="Annotation directory", type=str, required=True)
 parser.add_argument('-g', '--gt_dir', help="Converted GroundTruth dir (with convert_keras-yolo3.py)", type=str, required=True)
 parser.add_argument('-p', '--min_overlap', help="Minimum overlap", type=float, default=0.5)
 parser.add_argument('-r', '--global_results_file', help="Global results file", type=str, default='global_results.txt')
+parser.add_argument('-f', '--force_overwrite', help="Overwrite already generated resources.", action="store_true")
+parser.add_argument("-ca", "--canonical_bboxes", required=False, action="store_true", help="The training configuration.")
+parser.add_argument('--img_width', help="Image Width", type=int, default=None)
+parser.add_argument('--img_height', help="Image Height", type=int, default=None)
 main_args = parser.parse_args()
+
+if main_args.canonical_bboxes and not (main_args.img_width and main_args.img_height):
+    raise Exception('To use canonical bboxes you need to inform the --img_width and --img_height.')
 
 MINOVERLAP = main_args.min_overlap
 
-def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set_class_iou=None, predicted_dir=None, groundtruth_dir=None, global_map_result_file_path=None):
+def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set_class_iou=None, predicted_dir=None, groundtruth_dir=None, global_map_result_file_path=None, overwrite=False, output_version=None):
 
     # if there are no classes to ignore then replace None by empty list
     if ignore is None:
@@ -269,14 +278,16 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
     """
      Create a "tmp_files/" and "results/" directory
     """
-    tmp_files_path = "tmp_files"
+    tmp_files_path = "tmp_files_{}".format(output_version)
     if not os.path.exists(tmp_files_path): # if it doesn't exist already
       os.makedirs(tmp_files_path)
-    results_files_path = os.path.join(main_args.inference_dir, os.path.join('results',os.path.basename(predicted_dir)))
-    print('results_files_path',results_files_path)
-    # if os.path.exists(results_files_path): # if it exist already
-    #   # reset the results directory
-    #   shutil.rmtree(results_files_path)
+    results_files_path = os.path.join(main_args.inference_dir, os.path.join('results_min-iou-{}'.format(MINOVERLAP),os.path.basename(predicted_dir)))
+    # print('results_files_path',results_files_path)
+    if overwrite:
+          shutil.rmtree(results_files_path)
+    elif os.path.exists(results_files_path):
+        print('Skipping generating results.')
+        return
 
     # os.makedirs(results_files_path)
     if draw_plot:
@@ -284,13 +295,35 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
     if show_animation:
       os.makedirs(results_files_path + "/images")
 
-    hist_gt_areas = [] #areas of each gt bbox
-    hist_tp_gt_areas = [] #areas of each gt bbox marked as tp
-    hist_tp_pred_areas = [] #areas of each pred bbox marked as tp
+
+    hist_gt_areas = [] #areas of each gt bbox.
+    hist_tp_gt_areas = [] #areas of each gt bbox marked as tp. This are GT bboxes.
+    hist_tp_pred_areas = [] #areas of each pred bbox marked as tp. This are Prediction bboxes.
 
     hist_gt_height = [] #height of each gt bbox
-    hist_tp_gt_height = [] #height of each gt bbox marked as tp
-    hist_tp_pred_height = [] #height of each pred bbox marked as tp
+    hist_tp_gt_height = [] #height of each gt bbox marked as tp. This are GT bboxes.
+    hist_tp_pred_height = [] #height of each pred bbox marked as tp. This are Prediction bboxes.
+
+    hist_gt_ratio = [] #the h/w ratio of each gt bbox.
+    hist_tp_gt_ratio = [] #the h/w ratio of each gt bbox marked as tp. This are GT bboxes.
+
+    """
+    """
+    results_mapping_data = []
+    GT_FN_COUNTER = 0
+    def save_result(img_path, obj_bbox, result, gt_obj_bbox=None):
+        obj_bbox = obj_bbox.replace(' ', ',')
+        results_mapping_data.append('{} {} {} {}'.format(img_path, obj_bbox, result, gt_obj_bbox))
+
+    def persist_result(class_name):
+        print('GT_FN_COUNTER',GT_FN_COUNTER)
+        results_mapping_path = os.path.join(results_files_path,'results_mapping_{}.txt'.format(class_name))
+        with open(results_mapping_path, 'w') as res_f:
+            for data in results_mapping_data:
+                res_f.write(data + '\n')
+
+
+
 
     """
     Calculate area of a given bbox
@@ -307,12 +340,22 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
         return (bbox[3] - bbox[1] + 1)
 
     """
+    Calculate the bbox ratio (h/w)
+    """
+    def bbox_ratio(obj_bbox):
+        #bbox -> x_min, y_min, x_max, y_max
+        bbox = [ float(x) for x in obj_bbox.split() ]
+        #(y_max - y_min)/(x_max - x_min)
+        # print(obj_bbox)
+        return (bbox[3] - bbox[1]+1)/(bbox[2] - bbox[0]+1) #+1 to avoid zero divisions
+
+    """
      Ground-Truth
        Load each of the ground-truth files into a temporary ".json" file.
        Create a list of all the class names present in the ground-truth (gt_classes).
     """
     # get a list with the ground-truth files
-    print(os.path.join(groundtruth_dir,'*.txt'))
+    # print(os.path.join(groundtruth_dir,'*.txt'))
     ground_truth_files_list = glob.glob(os.path.join(groundtruth_dir,'*.txt'))
     if len(ground_truth_files_list) == 0:
       error("Error: No ground-truth files found!")
@@ -358,6 +401,8 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
             bounding_boxes.append({"class_name":class_name, "bbox":bbox, "used":False})
             hist_gt_areas.append(bbox_area(bbox))
             hist_gt_height.append(bbox_height(bbox))
+            hist_gt_ratio.append(bbox_ratio(bbox))
+            save_result(file_id, bbox, 'GT')
             # count that object
             if class_name in gt_counter_per_class:
               gt_counter_per_class[class_name] += 1
@@ -524,6 +569,10 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
                   hist_tp_gt_height.append(bbox_height(gt_match["bbox"]))
                   hist_tp_pred_areas.append(bbox_area(prediction["bbox"]))
                   hist_tp_pred_height.append(bbox_height(prediction["bbox"]))
+                  hist_tp_gt_ratio.append(bbox_ratio(gt_match["bbox"]))
+
+                  save_result(prediction["file_id"], prediction["bbox"], 'TP', gt_match["bbox"])
+
                   # update the ".json" file
                   with open(gt_file, 'w') as f:
                       f.write(json.dumps(ground_truth_data))
@@ -531,14 +580,19 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
                     status = "MATCH!"
                 else:
                   # false positive (multiple detection)
+                  save_result(prediction["file_id"], prediction["bbox"], 'FP-MULT')
                   fp[idx] = 1
                   if show_animation:
                     status = "REPEATED MATCH!"
+
           else:
             # false positive
+            save_result(prediction["file_id"], prediction["bbox"], 'FP-OVLP')
             fp[idx] = 1
             if ovmax > 0:
               status = "INSUFFICIENT OVERLAP"
+
+
 
           """
            Draw image to show animation
@@ -588,6 +642,28 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
             # save image to results
             output_img_path = results_files_path + "/images/" + class_name + "_prediction" + str(idx) + ".jpg"
             cv2.imwrite(output_img_path, img)
+
+
+        #selected missed GT
+        for txt_file in ground_truth_files_list:
+            #print(txt_file)
+            file_id = txt_file.split(".txt",1)[0]
+            file_id = os.path.basename(os.path.normpath(file_id))
+            gt_file = tmp_files_path + "/" + file_id + "_ground_truth.json"
+            ground_truth_data = json.load(open(gt_file))
+            if(file_id == '__home__grvaliati__workspace__datasets__pti__PTI01__C_ED4A-02__191__18__01__08__16__52__28__00267-capture'):
+                print(file_id)
+                print('ground_truth_data',len(ground_truth_data))
+                print(ground_truth_data)
+            unused_gt = [obj for obj in ground_truth_data if not obj['used']]
+            # print('unused_gt',len(unused_gt))
+            for obj in unused_gt:
+                if (file_id == '__home__grvaliati__workspace__datasets__pti__PTI01__C_ED4A-02__191__18__01__08__16__52__28__00267-capture'):
+                        print(obj)
+                GT_FN_COUNTER += 1
+                save_result(file_id, obj["bbox"], 'GT-FN')
+        persist_result(class_name)
+        results_mapping_data = []
 
         #print(tp)
         # compute precision/recall
@@ -672,9 +748,14 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
       results_file.write(text + "\n")
       print(text)
 
+      epoch_regex = re.compile('(ep[0-9]{3}|weights_final)')
+      epoch = epoch_regex.search(os.path.basename(predicted_dir)).group()
+      if not epoch:
+          raise Exception('Could not find the epoch number in the inference file name.')
+
       #write global result
       with open(global_map_result_file_path, 'a') as global_f:
-          global_f.write("{:.4f}% : {}\n".format(sum_AP, os.path.basename(predicted_dir).split('_')[3]))
+          global_f.write("{:.4f}% : {}\n".format(sum_AP, epoch))
 
     # remove the tmp_files directory
     shutil.rmtree(tmp_files_path)
@@ -931,14 +1012,128 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
         plt.savefig(os.path.join(results_files_path,'hist_height_gt_tp-pred_bins-manual.jpg'),dpi = 600)
         plt.cla()
 
-def convert_inference(annotation_file):
+        x_limit = 5
+        less_hist_gt_ratio = [i for i in hist_gt_ratio if i <= x_limit]
+        less_hist_tp_gt_ratio = [i for i in hist_tp_gt_ratio if i <= x_limit]
+        plt.title('bbox ratios (h/w) for GT and TP: zoomed in range 0 to {}'.format(x_limit))
+        _, bins, _ = plt.hist(less_hist_gt_ratio, bins=np.arange(0,x_limit,0.1), label='GT {}'.format(len(less_hist_gt_ratio)))
+        plt.hist(less_hist_tp_gt_ratio, facecolor='green', bins=bins, alpha=0.5, label='TP {}'.format(len(less_hist_tp_gt_ratio)))
+        plt.grid(True)
+        plt.xticks(bins,rotation=90)
+        plt.tick_params(axis='both', which='major', labelsize=6)
+        plt.legend(loc='upper right')
+        plt.ylabel('# bboxes')
+        plt.xlabel('bbox ratio')
+        plt.savefig(os.path.join(results_files_path,'hist_bboxratio_gt_tp_zoom.jpg'),dpi = 600)
+        plt.cla()
+
+def get_ratio(bbox):
+    x_min, y_min, x_max, y_max = bbox
+    return (y_max - y_min)/(x_max - x_min)
+
+def normal_round(number):
+    #3.5
+    integer_n = int(number) #3
+    float_n = number - integer_n #0.5
+    if float_n >= 0.5:
+        return integer_n + 1 #4
+    else:
+        return integer_n
+
+def get_canonical_bboxes(original_bboxes, img_width, img_height, round_type='normal', side_ajustment='one'):
+    acceptable_ratios = [1,2,3]
+    canonical_bboxes = []
+    for bbox in original_bboxes:
+        x_min, y_min, x_max, y_max = bbox
+        new_x_min, new_y_min, new_x_max, new_y_max = bbox
+
+        if side_ajustment=='one':
+
+            #step1: resize
+            original_ratio = get_ratio(bbox)
+            '''
+            if the original ratio is higher than maximum acceptable_ratios, we need to increase the width.
+            else we can increase the height.
+            '''
+            if original_ratio > max(acceptable_ratios):
+                #we need to increase the width so that the height reduces to maximum acceptable_ratios.
+                max_height_ratio = max(acceptable_ratios)
+                original_height = y_max - y_min
+                #the width should be increased to 1/max_height_ratio of the height.
+                new_width = original_height // max_height_ratio
+                #We need to expand it evenly in the sides.
+                original_width = x_max - x_min
+                width_diff = new_width - original_width #new_width is bigger.
+                new_x_min = x_min - width_diff//2
+                #We need to check if new_x_min still is in the image boundaries.
+                if new_x_min <= 0:
+                    #not enough space
+                    new_x_min = 0
+                    #we will expand the remaining to the other direction.
+                new_x_max = new_x_min + new_width
+                #lets check the same for the new_x_max
+                if new_x_max >= img_width:
+                    #not enough space
+                    new_x_max = img_width
+                    new_x_min = img_width - new_width
+            else:
+                #we can increase the height
+                if round_type == 'normal':
+                    new_height_ratio = normal_round(original_ratio) #normal rounding (up or down).
+                    if new_height_ratio < 1:
+                        new_height_ratio = 1
+                elif round_type == 'up':
+                    new_height_ratio = math.ceil(original_ratio) #rounding up
+                new_height = math.ceil(new_height_ratio*(x_max - x_min)) # the ratio is relative to the width.
+                #In how many pixels did the height grow?
+                original_height = y_max - y_min
+                height_diff = new_height - original_height
+                #We need to split the growth up and down.
+                #So, we put the ymin half the height_diff up.
+                half_diff = height_diff // 2
+                new_y_min = y_min - half_diff
+                #But we check how many pixels are left upwards. We cannot overflow the img borders.
+                if not (y_min - half_diff >= 0):
+                    #not enough space.
+                    new_y_min = 0
+                #Now we have found the good new position for y_min, we add the complete needed height.
+                new_y_max = new_y_min + new_height
+                #We also need to check if we kept outselves the bottom image boundaries.
+                if new_y_max >= img_height: #img_height does not include zero.
+                    #We got out of space in the bottom. So lets move up the bbox to keep in the limits.
+    #                 remaining_height = img_height - new_y_max
+    #                 new_y_min -= remaining_height
+    #                 new_y_max -= remaining_height
+                    new_y_max = img_height
+                    new_y_min = img_height - new_height
+
+            #Lets check if we did it right, otherwise fallback to the original bbox.
+            if not (new_x_min >= 0 and new_y_min >= 0 and new_x_max < img_width and new_y_max < img_height):
+                # messed up, fallback!
+    #             print('Could not convert the original bbox. We are going to use the original. Original: {}. Problematic: {}'.format(bbox, [new_x_min, new_y_min, new_x_max, new_y_max]))
+                canonical_bboxes.append(bbox)
+            else:
+                canonical_bboxes.append([new_x_min, new_y_min, new_x_max, new_y_max])
+        elif side_ajustment=='both':
+            pass
+
+    return canonical_bboxes
+
+def convert_inference(annotation_file, overwrite=False):
     with open('extra/class_list.txt', 'r') as class_file:
         class_map = class_file.readlines()
-    print(class_map)
-
-    pred_output_path = os.path.join(main_args.inference_dir, 'pred_{}'.format(os.path.basename(annotation_file).replace('.txt','')))
+    # print(class_map)
+    folder_prefix = 'pred_{}'
+    if main_args.canonical_bboxes:
+        folder_prefix = 'canonical_'+folder_prefix
+    pred_output_path = os.path.join(main_args.inference_dir, folder_prefix.format(os.path.basename(annotation_file).replace('.txt','')))
     if os.path.exists(pred_output_path):
-        shutil.rmtree(pred_output_path)
+        if overwrite:
+            shutil.rmtree(pred_output_path)
+        else:
+            print('Skipping inference parsing.',pred_output_path)
+            return pred_output_path
+
     os.makedirs(pred_output_path)
 
     with open(annotation_file, 'r') as annot_f:
@@ -962,6 +1157,12 @@ def convert_inference(annotation_file):
                     # Here we are dealing with predictions annotations
                     # <class_name> <confidence> <left> <top> <right> <bottom>
                     x_min, y_min, x_max, y_max, class_id, score = list(map(float, bbox.split(',')))
+                    if main_args.canonical_bboxes:
+                        x_min, y_min, x_max, y_max = get_canonical_bboxes(
+                            [ [x_min, y_min, x_max, y_max] ],
+                            img_width=main_args.img_width,
+                            img_height=main_args.img_height)[0]
+
                     out_box = '{} {} {} {} {} {}'.format(
                         class_map[int(class_id)].strip(), score,  x_min, y_min, x_max, y_max)
 
@@ -975,17 +1176,23 @@ if __name__ == '__main__':
     output_version = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     with open(main_args.global_results_file, 'a') as global_f:
         global_f.write("Evaluated at: {}\n".format(output_version))
-        global_f.write(main_args.inference_dir+"\n")
+        global_f.write(os.path.basename(main_args.inference_dir)+"\n")
+        global_f.write("GT: " + os.path.abspath(main_args.gt_dir) + '\n')
+        global_f.write("min-iou: {}".format(main_args.min_overlap) + '\n')
+        if main_args.canonical_bboxes:
+            global_f.write('Canonical bboxes: the predicted bboxes evaluated have been parsed to canonical by eval_all_inferences.py.\n')
 
     inferences = glob.glob(os.path.join(main_args.inference_dir, 'infer_*.txt'))
     inferences.sort()
 
     for inference in inferences:
-        print(inference)
-        pred_converted_inference_dir = convert_inference(inference)
+        print('For: ',os.path.basename(inference))
+        pred_converted_inference_dir = convert_inference(inference, main_args.force_overwrite)
         eval_inference(
             predicted_dir=pred_converted_inference_dir,
             groundtruth_dir=os.path.abspath(main_args.gt_dir),
             global_map_result_file_path=main_args.global_results_file,
-            no_plot=False
+            no_plot=False,
+            overwrite=main_args.force_overwrite,
+            output_version=output_version
             )
