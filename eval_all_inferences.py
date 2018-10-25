@@ -8,10 +8,13 @@ import argparse
 import datetime
 import math
 import re
+from collections import OrderedDict
 
 parser = argparse.ArgumentParser()
+group = parser.add_mutually_exclusive_group(required=True)
+group.add_argument('-g', '--gt_dir', help="Converted GroundTruth dir (with convert_keras-yolo3.py)", type=str)
+group.add_argument('-ga', '--gt_annot', help="Original GT annot file. It will be auto converted.", type=str)
 parser.add_argument('-i', '--inference_dir', help="Annotation directory", type=str, required=True)
-parser.add_argument('-g', '--gt_dir', help="Converted GroundTruth dir (with convert_keras-yolo3.py)", type=str, required=True)
 parser.add_argument('-p', '--min_overlap', help="Minimum overlap", type=float, default=0.5)
 parser.add_argument('-r', '--global_results_file', help="Global results file", type=str, default='global_results.txt')
 parser.add_argument('-f', '--force_overwrite', help="Overwrite already generated resources.", action="store_true")
@@ -25,9 +28,9 @@ if main_args.canonical_bboxes and not (main_args.img_width and main_args.img_hei
 
 MINOVERLAP = main_args.min_overlap
 
-def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set_class_iou=None, predicted_dir=None, groundtruth_dir=None, global_map_result_file_path=None, overwrite=False, output_version=None):
-
+def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set_class_iou=None, predicted_dir=None, groundtruth_dir=None, global_map_result_file_path=None, overwrite=False, output_version=None, first_inference=False):
     # if there are no classes to ignore then replace None by empty list
+
     if ignore is None:
       ignore = []
 
@@ -278,12 +281,12 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
     """
      Create a "tmp_files/" and "results/" directory
     """
-    tmp_files_path = "tmp_files_{}".format(output_version)
+    tmp_files_path = "/tmp/tmp_files_{}".format(output_version)
     if not os.path.exists(tmp_files_path): # if it doesn't exist already
       os.makedirs(tmp_files_path)
     results_files_path = os.path.join(main_args.inference_dir, os.path.join('results_min-iou-{}'.format(MINOVERLAP),os.path.basename(predicted_dir)))
     # print('results_files_path',results_files_path)
-    if overwrite:
+    if overwrite and os.path.exists(results_files_path):
           shutil.rmtree(results_files_path)
     elif os.path.exists(results_files_path):
         print('Skipping generating results.')
@@ -316,7 +319,7 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
         results_mapping_data.append('{} {} {} {}'.format(img_path, obj_bbox, result, gt_obj_bbox))
 
     def persist_result(class_name):
-        print('GT_FN_COUNTER',GT_FN_COUNTER)
+        # print('GT_FN_COUNTER',GT_FN_COUNTER)
         results_mapping_path = os.path.join(results_files_path,'results_mapping_{}.txt'.format(class_name))
         with open(results_mapping_path, 'w') as res_f:
             for data in results_mapping_data:
@@ -357,8 +360,12 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
     # get a list with the ground-truth files
     # print(os.path.join(groundtruth_dir,'*.txt'))
     ground_truth_files_list = glob.glob(os.path.join(groundtruth_dir,'*.txt'))
+
+    if not  os.path.exists(groundtruth_dir):
+        error('Error: Seems like you did not create the GT files yet: {}'.format(groundtruth_dir))
+
     if len(ground_truth_files_list) == 0:
-      error("Error: No ground-truth files found!")
+      error("Error: No ground-truth files found! Do we have {}?".format(groundtruth_dir))
     ground_truth_files_list.sort()
     # dictionary with counter per class
     gt_counter_per_class = {}
@@ -493,6 +500,7 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
     with open(results_files_path + "/results.txt", 'w') as results_file:
       results_file.write("# AP and precision/recall per class\n")
       count_true_positives = {}
+
       for class_index, class_name in enumerate(gt_classes):
         count_true_positives[class_name] = 0
         """
@@ -688,6 +696,10 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
         ap, mrec, mprec = voc_ap(rec, prec)
         sum_AP += ap
         text = "{0:.2f}%".format(ap*100) + " = " + class_name + " AP  " #class_name + " AP = {0:.2f}%".format(ap*100)
+        # print(text)
+        #write global result
+        # with open(global_map_result_file_path, 'a') as global_f:
+        #     global_f.write(text + "\n")
         """
          Write to results.txt
         """
@@ -755,9 +767,25 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
 
       #write global result
       with open(global_map_result_file_path, 'a') as global_f:
-          global_f.write("{:.4f}% : {}\n".format(sum_AP, epoch))
+          ordered_ap_dictionary = OrderedDict(sorted(ap_dictionary.items()))
+          if first_inference:
+              #write headers.
+              global_f.write("inference_dir;gt_dir;min_iou;epoch;mAP")
+              for cl in ordered_ap_dictionary:
+                  global_f.write(";{}".format(cl))
+              global_f.write("\n")
 
-    # remove the tmp_files directory
+          #write scores.
+          global_f.write("{};{};{};{};{:.4f}".format(
+            os.path.basename(main_args.inference_dir),
+            os.path.basename(main_args.gt_dir if main_args.gt_dir else main_args.gt_annot),
+            main_args.min_overlap,
+            epoch,
+            mAP))
+          for cl in ordered_ap_dictionary:
+              global_f.write(";{:.4f}".format(ordered_ap_dictionary[cl]))
+          global_f.write("\n")
+
     shutil.rmtree(tmp_files_path)
 
     """
@@ -999,6 +1027,21 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
         plt.savefig(os.path.join(results_files_path,'hist_height_gt_tp_zoom_bins-manual.jpg'),dpi = 600)
         plt.cla()
 
+        x_limit = 300
+        less_x_hist_gt_height = [i for i in hist_gt_height if i <= x_limit]
+        less_x_hist_tp_gt_height = [i for i in hist_tp_gt_height if i <= x_limit]
+        plt.title('GT x TP bbox heights. Step 25. Zoom <= {}.'.format(x_limit))
+        _, bins, _ = plt.hist(less_x_hist_gt_height, bins=np.arange(0,x_limit,25), label='GT {}'.format(len(less_x_hist_gt_height)))
+        plt.hist(less_x_hist_tp_gt_height, facecolor='green', bins=bins, alpha=0.5, label='TP {}'.format(len(less_x_hist_tp_gt_height)))
+        plt.grid(True)
+        plt.xticks(bins,rotation=90)
+        plt.tick_params(axis='both', which='major', labelsize=6)
+        plt.legend(loc='upper right')
+        plt.ylabel('# bboxes')
+        plt.xlabel('bbox height')
+        plt.savefig(os.path.join(results_files_path,'hist_height_gt_tp_zoom_step-25.jpg'),dpi = 600)
+        plt.cla()
+
         n_bins = 50
         plt.title('GT x TP-Predictions bbox heights. BINS={}'.format(n_bins))
         _, bins, _ = plt.hist(hist_gt_height, bins=n_bins, label='GT {}'.format(len(hist_gt_height)))
@@ -1119,56 +1162,72 @@ def get_canonical_bboxes(original_bboxes, img_width, img_height, round_type='nor
 
     return canonical_bboxes
 
-def convert_inference(annotation_file, overwrite=False):
-    with open('extra/class_list.txt', 'r') as class_file:
-        class_map = class_file.readlines()
-    # print(class_map)
-    folder_prefix = 'pred_{}'
-    if main_args.canonical_bboxes:
-        folder_prefix = 'canonical_'+folder_prefix
-    pred_output_path = os.path.join(main_args.inference_dir, folder_prefix.format(os.path.basename(annotation_file).replace('.txt','')))
-    if os.path.exists(pred_output_path):
-        if overwrite:
-            shutil.rmtree(pred_output_path)
-        else:
-            print('Skipping inference parsing.',pred_output_path)
-            return pred_output_path
+def convert_inference(annotation_file, type=None, overwrite=False):
+    PRED_TYPE='pred'
+    GT_TYPE='gt'
 
-    os.makedirs(pred_output_path)
+    if not type:
+        raise Exception('Missing inference type for convertion.')
+    if type not in [PRED_TYPE, GT_TYPE]:
+        raise Exception('Unknown type for convertion')
+
+    with open('extra/class_list_pti01v3.txt', 'r') as class_file:
+        class_map = class_file.readlines()
+
+    if type==PRED_TYPE:
+        folder_prefix = 'pred_{}'
+        if main_args.canonical_bboxes:
+            folder_prefix = 'canonical_'+folder_prefix
+        output_path = os.path.join(main_args.inference_dir, folder_prefix.format(os.path.basename(annotation_file).replace('.txt','')))
+    else:
+        if annotation_file:
+            output_path = 'gt_' + os.path.basename(main_args.gt_annot).replace('.txt','')
+        else:
+            output_path = os.path.abspath(main_args.gt_dir)
+
+    if os.path.exists(output_path):
+        if overwrite and os.path.exists(output_path):
+            shutil.rmtree(output_path)
+        else:
+            print('Skipping inference parsing.', type, output_path)
+            return output_path
+
+    os.makedirs(output_path)
 
     with open(annotation_file, 'r') as annot_f:
         for annot in annot_f:
             annot = annot.split(' ')
             img_path = annot[0].strip()
             file_name = img_path.replace('.jpg', '.txt').replace('/', '__')
-            output_file_path = os.path.join(pred_output_path, file_name)
+            output_file_path = os.path.join(output_path, file_name)
             os.path.dirname(output_file_path)
 
             with open(output_file_path, 'w') as out_f:
                 for bbox in annot[1:]:
-                    # if ARGS.gt:
-                    #     # Here we are dealing with ground-truth annotations
-                    #     # <class_name> <left> <top> <right> <bottom> [<difficult>]
-                    #     # todo: handle difficulty
-                    #     x_min, y_min, x_max, y_max, class_id = list(map(float, bbox.split(',')))
-                    #     out_box = '{} {} {} {} {}'.format(
-                    #         class_map[int(class_id)].strip(), x_min, y_min, x_max, y_max)
-                    # else:
-                    # Here we are dealing with predictions annotations
-                    # <class_name> <confidence> <left> <top> <right> <bottom>
-                    x_min, y_min, x_max, y_max, class_id, score = list(map(float, bbox.split(',')))
-                    if main_args.canonical_bboxes:
-                        x_min, y_min, x_max, y_max = get_canonical_bboxes(
-                            [ [x_min, y_min, x_max, y_max] ],
-                            img_width=main_args.img_width,
-                            img_height=main_args.img_height)[0]
+                    if type==GT_TYPE:
+                        # Here we are dealing with ground-truth annotations
+                        # <class_name> <left> <top> <right> <bottom> [<difficult>]
+                        # todo: handle difficulty
+                        x_min, y_min, x_max, y_max, class_id = list(map(float, bbox.split(',')))
+                        # print(class_map, class_id)
+                        out_box = '{} {} {} {} {}'.format(
+                            class_map[int(class_id)].strip(), x_min, y_min, x_max, y_max)
+                    else:
+                        # Here we are dealing with predictions annotations
+                        # <class_name> <confidence> <left> <top> <right> <bottom>
+                        x_min, y_min, x_max, y_max, class_id, score = list(map(float, bbox.split(',')))
+                        if main_args.canonical_bboxes:
+                            x_min, y_min, x_max, y_max = get_canonical_bboxes(
+                                [ [x_min, y_min, x_max, y_max] ],
+                                img_width=main_args.img_width,
+                                img_height=main_args.img_height)[0]
 
-                    out_box = '{} {} {} {} {} {}'.format(
-                        class_map[int(class_id)].strip(), score,  x_min, y_min, x_max, y_max)
+                        out_box = '{} {} {} {} {} {}'.format(
+                            class_map[int(class_id)].strip(), score,  x_min, y_min, x_max, y_max)
 
                     out_f.write(out_box + "\n")
 
-    return pred_output_path
+    return output_path
 
 
 if __name__ == '__main__':
@@ -1177,7 +1236,7 @@ if __name__ == '__main__':
     with open(main_args.global_results_file, 'a') as global_f:
         global_f.write("Evaluated at: {}\n".format(output_version))
         global_f.write(os.path.basename(main_args.inference_dir)+"\n")
-        global_f.write("GT: " + os.path.abspath(main_args.gt_dir) + '\n')
+        global_f.write("GT: " + os.path.abspath(main_args.gt_dir) if main_args.gt_dir else os.path.abspath(main_args.gt_annot) + '\n')
         global_f.write("min-iou: {}".format(main_args.min_overlap) + '\n')
         if main_args.canonical_bboxes:
             global_f.write('Canonical bboxes: the predicted bboxes evaluated have been parsed to canonical by eval_all_inferences.py.\n')
@@ -1185,14 +1244,20 @@ if __name__ == '__main__':
     inferences = glob.glob(os.path.join(main_args.inference_dir, 'infer_*.txt'))
     inferences.sort()
 
+    gt_annot_file = main_args.gt_annot if main_args.gt_annot else None
+    gt_converted_dir = convert_inference(gt_annot_file , type='gt', overwrite=main_args.force_overwrite)
+
+    first_inference = True
     for inference in inferences:
         print('For: ',os.path.basename(inference))
-        pred_converted_inference_dir = convert_inference(inference, main_args.force_overwrite)
+        pred_converted_inference_dir = convert_inference(inference, type='pred', overwrite=main_args.force_overwrite)
         eval_inference(
             predicted_dir=pred_converted_inference_dir,
-            groundtruth_dir=os.path.abspath(main_args.gt_dir),
+            groundtruth_dir=gt_converted_dir,
             global_map_result_file_path=main_args.global_results_file,
             no_plot=False,
             overwrite=main_args.force_overwrite,
-            output_version=output_version
+            output_version=output_version,
+            first_inference=first_inference
             )
+        first_inference = False
