@@ -44,6 +44,15 @@ exp_regex_compilation_patterns.append(default_pattern)
 default_infusion_pattern = '_logsdefault-seg-'
 exp_regex_compilation_patterns.append(default_infusion_pattern)
 
+caltech_yolov3_tiny = '_logscaltech_default-'
+exp_regex_compilation_patterns.append(caltech_yolov3_tiny)
+caltech_yolov3 = '_logscaltech_yolov3-'
+exp_regex_compilation_patterns.append(caltech_yolov3)
+caltech_yolov3_tiny_infusion = '_logscaltech_seg-'
+exp_regex_compilation_patterns.append(caltech_yolov3_tiny_infusion)
+caltech_yolov3_infusion = '_logscaltech_yolov3-seg-'
+exp_regex_compilation_patterns.append(caltech_yolov3_infusion)
+
 exp_regex_compilation_string = ''
 for i, exp_pattern in enumerate(exp_regex_compilation_patterns):
     if i != 0:
@@ -86,6 +95,14 @@ if main_args.run_inferences:
                 config_file = 'train-pti01-yolov3-config-{}.yml'.format(experiment_match.replace(default_pattern,''))
             elif tiny_pattern in experiment_match:
                 config_file = 'train-pti01-yolov3-tiny-config-{}.yml'.format(experiment_match.replace(tiny_pattern,''))
+            elif caltech_yolov3_tiny in experiment_match:
+                config_file = 'train-caltech-yolov3-tiny-config-{}.yml'.format(experiment_match.replace(caltech_yolov3_tiny,''))
+            elif caltech_yolov3_tiny_infusion in experiment_match:
+                config_file = 'train-caltech-yolov3-tiny-infusion-config-{}.yml'.format(experiment_match.replace(caltech_yolov3_tiny_infusion,''))
+            elif caltech_yolov3_infusion in experiment_match:
+                config_file = 'train-caltech-yolov3-infusion-config-{}.yml'.format(experiment_match.replace(caltech_yolov3_infusion,''))
+            elif caltech_yolov3 in experiment_match and not 'tiny' in experiment_match:
+                config_file = 'train-caltech-yolov3-config-{}.yml'.format(experiment_match.replace(caltech_yolov3,''))
             else:
                 raise Exception("Could not find the experiment pattern.")
 
@@ -116,6 +133,8 @@ if main_args.run_inferences:
             command = 'python3 eval_all_inferences.py -i {} -ga {} -p {}'.format(inference_path, gt_file_path, min_overlap)
             if main_args.force_overwrite:
                 command += ' -f'
+            if 'class_translation_path' in train_config:
+                command += ' -de ' + os.path.join(main_args.framework, train_config['test_path'])
             print('Running',command)
             p1 = subprocess.Popen(command.split(' '))
             p1.wait()

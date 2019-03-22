@@ -9,6 +9,7 @@ import datetime
 import math
 import re
 from collections import OrderedDict
+import numpy as np
 
 parser = argparse.ArgumentParser()
 group = parser.add_mutually_exclusive_group(required=True)
@@ -18,6 +19,7 @@ parser.add_argument('-i', '--inference_dir', help="Annotation directory", type=s
 parser.add_argument('-p', '--min_overlap', help="Minimum overlap", type=float, default=0.5)
 parser.add_argument('-r', '--global_results_file', help="Global results file", type=str, default='global_results.txt')
 parser.add_argument('-f', '--force_overwrite', help="Overwrite already generated resources.", action="store_true")
+parser.add_argument('-de', '--detranslate_from', help="Keras dataset file with all original and non-translated classes. This will save additional data about the original class for GT bboxes.", type=str, required=False, default=False)
 parser.add_argument("-ca", "--canonical_bboxes", required=False, action="store_true", help="The training configuration.")
 parser.add_argument('--img_width', help="Image Width", type=int, default=None)
 parser.add_argument('--img_height', help="Image Height", type=int, default=None)
@@ -28,7 +30,10 @@ if main_args.canonical_bboxes and not (main_args.img_width and main_args.img_hei
 
 MINOVERLAP = main_args.min_overlap
 
-def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set_class_iou=None, predicted_dir=None, groundtruth_dir=None, global_map_result_file_path=None, overwrite=False, output_version=None, first_inference=False):
+with open('extra/class_list_pti01v3.txt', 'r') as class_file:
+    class_map = [c.strip() for c in class_file.readlines()]
+
+def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set_class_iou=None, predicted_dir=None, groundtruth_dir=None, global_map_result_file_path=None, overwrite=False, output_version=None, first_inference=False, detranslation_dict=None):
     # if there are no classes to ignore then replace None by empty list
 
     if ignore is None:
@@ -69,6 +74,52 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
       except ImportError:
         print("\"matplotlib\" not found, please install it to get the resulting plots.")
         no_plot = True
+
+    def log_average_miss_rate(precision, fp_cumsum, num_images):
+        """
+            log-average miss rate:
+                Calculated by averaging miss rates at 9 evenly spaced FPPI points
+                between 10e-2 and 10e0, in log-space.
+
+            output:
+                    lamr | log-average miss rate
+                    mr | miss rate
+                    fppi | false positives per image
+
+            references:
+                [1] Dollar, Piotr, et al. "Pedestrian Detection: An Evaluation of the
+                   State of the Art." Pattern Analysis and Machine Intelligence, IEEE
+                   Transactions on 34.4 (2012): 743 - 761.
+        """
+
+        # if there were no detections of that class
+        if precision.size == 0:
+            lamr = 0
+            mr = 1
+            fppi = 0
+            return lamr, mr, fppi
+
+        print('LEN',len(fp_cumsum), num_images, len(precision))
+
+        fppi = fp_cumsum / float(num_images)
+        mr = (1 - precision)
+        print("fppi,mr",len(fppi),len(mr))
+        print("fppi,mr",fppi[1],mr[-1],mr[-2])
+
+        fppi_tmp = np.insert(fppi, 0, -1.0)
+        mr_tmp = np.insert(mr, 0, 1.0)
+
+        # Use 9 evenly spaced reference points in log-space
+        ref = np.logspace(-2.0, 0.0, num = 9)
+        for i, ref_i in enumerate(ref):
+            # np.where() will always find at least 1 index, since min(ref) = 0.01 and min(fppi_tmp) = -1.0
+            j = np.where(fppi_tmp <= ref_i)[-1][-1]
+            ref[i] = mr_tmp[j]
+
+        # log(0) is undefined, so we use the np.maximum(1e-10, ref)
+        lamr = math.exp(np.mean(np.log(np.maximum(1e-10, ref))))
+
+        return lamr, mr, fppi
 
     """
      throw error and exit
@@ -314,9 +365,30 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
     """
     results_mapping_data = []
     GT_FN_COUNTER = 0
-    def save_result(img_path, obj_bbox, result, gt_obj_bbox=None):
+
+    def detranslate_gt_class(img_path, obj_bbox):
+        img_path += '.jpg'
+        img_path = img_path.replace('__', '/')
+        bboxes = detranslation_dict[img_path]
+        for b in bboxes:
+            #obj_bbox 474.0,28.0,505.0,101.0
+            if obj_bbox == '{},{},{},{}'.format(b[0],b[1],b[2],b[3]):
+                return b[4] #class
+
+        raise Exception('Could not find a bbox match when detranslating')
+
+    def save_result(img_path, obj_bbox, result, gt_obj_bbox=None, class_name=None):
         obj_bbox = obj_bbox.replace(' ', ',')
-        results_mapping_data.append('{} {} {} {}'.format(img_path, obj_bbox, result, gt_obj_bbox))
+        gt_obj_bbox = gt_obj_bbox.replace(' ', ',') if gt_obj_bbox else None
+
+        detranslated_class = None
+        if detranslation_dict and 'GT' in result:
+            detranslated_class = detranslate_gt_class(img_path, obj_bbox)
+        elif detranslation_dict and ('TP' == result or 'FP-MULT' == result):
+            detranslated_class = detranslate_gt_class(img_path, gt_obj_bbox)
+
+        class_id = class_map.index(class_name) if class_name else None
+        results_mapping_data.append('{} {} {} {} {} {}'.format(img_path, obj_bbox, result, gt_obj_bbox, class_id, detranslated_class))
 
     def persist_result(class_name):
         # print('GT_FN_COUNTER',GT_FN_COUNTER)
@@ -360,6 +432,7 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
     # get a list with the ground-truth files
     # print(os.path.join(groundtruth_dir,'*.txt'))
     ground_truth_files_list = glob.glob(os.path.join(groundtruth_dir,'*.txt'))
+    print('ground_truth_files_list', len(ground_truth_files_list))
 
     if not  os.path.exists(groundtruth_dir):
         error('Error: Seems like you did not create the GT files yet: {}'.format(groundtruth_dir))
@@ -369,10 +442,18 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
     ground_truth_files_list.sort()
     # dictionary with counter per class
     gt_counter_per_class = {}
+    counter_images_per_class = {}
 
+    tmp_counter = 0
+    wanted_counter = 113
+    wanted_fileid = '__home__grvaliati__workspace__datasets__caltech__parsers__caltech-pedestrian-dataset-to-yolo-format-converter__images__set06_V001_749'
     for txt_file in ground_truth_files_list:
-      #print(txt_file)
+      tmp_counter += 1
+      # print(txt_file)
+      # print(tmp_counter)
       file_id = txt_file.split(".txt",1)[0]
+      if tmp_counter == wanted_counter:
+          print('>>>>>>>>>>>>',file_id)
       file_id = os.path.basename(os.path.normpath(file_id))
       # check if there is a correspondent predicted objects file
       if not os.path.exists(os.path.join(predicted_dir,file_id + ".txt")):
@@ -383,6 +464,7 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
       # create ground-truth dictionary
       bounding_boxes = []
       is_difficult = False
+      already_seen_classes = []
       for line in lines_list:
         try:
           if "difficult" in line:
@@ -409,23 +491,37 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
             hist_gt_areas.append(bbox_area(bbox))
             hist_gt_height.append(bbox_height(bbox))
             hist_gt_ratio.append(bbox_ratio(bbox))
-            save_result(file_id, bbox, 'GT')
+            save_result(file_id, bbox, 'GT', class_name=class_name)
             # count that object
             if class_name in gt_counter_per_class:
               gt_counter_per_class[class_name] += 1
             else:
               # if class didn't exist yet
               gt_counter_per_class[class_name] = 1
+
+            if class_name not in already_seen_classes:
+                if class_name in counter_images_per_class:
+                    counter_images_per_class[class_name] += 1
+                else:
+                    # if class didn't exist yet
+                    counter_images_per_class[class_name] = 1
+                already_seen_classes.append(class_name)
+
+
       # dump bounding_boxes into a ".json" file
       with open(tmp_files_path + "/" + file_id + "_ground_truth.json", 'w') as outfile:
         json.dump(bounding_boxes, outfile)
 
+      if tmp_counter == wanted_counter:
+          print('>>>>>>>>>>>>bounding_boxes', len(bounding_boxes), bounding_boxes)
+
     gt_classes = list(gt_counter_per_class.keys())
+    gt_total = sum(gt_counter_per_class.values())
     # let's sort the classes alphabetically
     gt_classes = sorted(gt_classes)
     n_classes = len(gt_classes)
     #print(gt_classes)
-    #print(gt_counter_per_class)
+    print('gt_counter_per_class',gt_counter_per_class)
 
     """
      Check format of the flag --set-class-iou (if used)
@@ -458,6 +554,8 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
     # get a list with the predicted files
     predicted_files_list = glob.glob(os.path.join(predicted_dir, '*.txt'))
     predicted_files_list.sort()
+
+    print('predicted_files_list', len(predicted_files_list))
 
     for class_index, class_name in enumerate(gt_classes):
       bounding_boxes = []
@@ -495,6 +593,8 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
     """
     sum_AP = 0.0
     ap_dictionary = {}
+    wap_dictionary = {}
+    lamr_dictionary = {}
 
     # open file to store the results
     with open(results_files_path + "/results.txt", 'w') as results_file:
@@ -517,6 +617,8 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
         fp = [0] * nd
         for idx, prediction in enumerate(predictions_data):
           file_id = prediction["file_id"]
+          if file_id == wanted_fileid:
+              print('wanted idx', idx)
           if show_animation:
             # find ground truth image
             ground_truth_img = glob.glob1(img_path, file_id + ".*")
@@ -579,7 +681,7 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
                   hist_tp_pred_height.append(bbox_height(prediction["bbox"]))
                   hist_tp_gt_ratio.append(bbox_ratio(gt_match["bbox"]))
 
-                  save_result(prediction["file_id"], prediction["bbox"], 'TP', gt_match["bbox"])
+                  save_result(prediction["file_id"], prediction["bbox"], 'TP', gt_match["bbox"], class_name=class_name)
 
                   # update the ".json" file
                   with open(gt_file, 'w') as f:
@@ -588,18 +690,25 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
                     status = "MATCH!"
                 else:
                   # false positive (multiple detection)
-                  save_result(prediction["file_id"], prediction["bbox"], 'FP-MULT')
+                  save_result(prediction["file_id"], prediction["bbox"], 'FP-MULT', gt_match["bbox"], class_name=class_name)
                   fp[idx] = 1
                   if show_animation:
                     status = "REPEATED MATCH!"
 
           else:
             # false positive
-            save_result(prediction["file_id"], prediction["bbox"], 'FP-OVLP')
+            save_result(prediction["file_id"], prediction["bbox"], 'FP-OVLP', class_name=class_name)
             fp[idx] = 1
             if ovmax > 0:
               status = "INSUFFICIENT OVERLAP"
 
+          if prediction['file_id'] == wanted_fileid:
+            print('prediction', prediction)
+            print('tp',tp[idx])
+            print('fp',fp[idx])
+            print('rec',float(tp[idx]) / gt_counter_per_class[class_name])
+            print('prec',float(tp[idx]) / (fp[idx] + tp[idx]))
+            print('gt_counter_per_class[class_name]',gt_counter_per_class[class_name])
 
 
           """
@@ -652,6 +761,8 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
             cv2.imwrite(output_img_path, img)
 
 
+
+
         #selected missed GT
         for txt_file in ground_truth_files_list:
             #print(txt_file)
@@ -659,19 +770,25 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
             file_id = os.path.basename(os.path.normpath(file_id))
             gt_file = tmp_files_path + "/" + file_id + "_ground_truth.json"
             ground_truth_data = json.load(open(gt_file))
-            if(file_id == '__home__grvaliati__workspace__datasets__pti__PTI01__C_ED4A-02__191__18__01__08__16__52__28__00267-capture'):
-                print(file_id)
-                print('ground_truth_data',len(ground_truth_data))
+            if file_id == wanted_fileid:
                 print(ground_truth_data)
+
             unused_gt = [obj for obj in ground_truth_data if not obj['used']]
             # print('unused_gt',len(unused_gt))
             for obj in unused_gt:
-                if (file_id == '__home__grvaliati__workspace__datasets__pti__PTI01__C_ED4A-02__191__18__01__08__16__52__28__00267-capture'):
-                        print(obj)
+                if class_name != obj["class_name"]:
+                    continue
                 GT_FN_COUNTER += 1
-                save_result(file_id, obj["bbox"], 'GT-FN')
+                save_result(file_id, obj["bbox"], 'GT-FN', class_name=obj["class_name"])
+
         persist_result(class_name)
         results_mapping_data = []
+
+        print('len tp fp', len(tp), len(fp))
+
+        for i in range(10):
+            print('fp/tp')
+            print(fp[i], tp[i])
 
         #print(tp)
         # compute precision/recall
@@ -684,6 +801,12 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
           tp[idx] += cumsum
           cumsum += val
         #print(tp)
+        for i in range(10):
+            print('fp/tp cumsum')
+            print(fp[i], tp[i])
+
+        print('gt_counter_per_class[class_name]',gt_counter_per_class[class_name])
+
         rec = tp[:]
         for idx, val in enumerate(tp):
           rec[idx] = float(tp[idx]) / gt_counter_per_class[class_name]
@@ -693,9 +816,20 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
           prec[idx] = float(tp[idx]) / (fp[idx] + tp[idx])
         #print(prec)
 
-        ap, mrec, mprec = voc_ap(rec, prec)
+        for i in range(10):
+            print('prec(fp)/rec(tp)')
+            print(prec[i], rec[i])
+
+        print('BEFORE VOCAP', len(rec), len(prec))
+
+        ap, mrec, mprec = voc_ap(rec[:], prec[:])
         sum_AP += ap
         text = "{0:.2f}%".format(ap*100) + " = " + class_name + " AP  " #class_name + " AP = {0:.2f}%".format(ap*100)
+
+        for i in range(10):
+            print('mprec/mrec')
+            print(mprec[i], mrec[i],)
+
         # print(text)
         #write global result
         # with open(global_map_result_file_path, 'a') as global_f:
@@ -708,7 +842,30 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
         results_file.write(text + "\n Precision: " + str(rounded_prec) + "\n Recall   :" + str(rounded_rec) + "\n\n")
         if not quiet:
           print(text)
+
+        # print('gt_counter_per_class',gt_counter_per_class)
         ap_dictionary[class_name] = ap
+        wap_dictionary[class_name] = ap * gt_counter_per_class[class_name]
+        # print('gt_total', gt_total)
+        # print('ap_dictionary', ap_dictionary)
+        # print('wap_dictionary', wap_dictionary)
+
+        n_images = counter_images_per_class[class_name]
+        lamr, mr, fppi = log_average_miss_rate(np.array(rec), np.array(fp), n_images)
+        lamr_dictionary[class_name] = lamr
+
+        npys_output_folder = '/media/gustavo/GRV/workspace/mestrado/inferences/npys'
+        np.save('{}/{}_{}_{}_mr.npy'.format(npys_output_folder, os.path.basename(predicted_dir), class_name, main_args.min_overlap), mr)
+        np.save('{}/{}_{}_{}_fppi.npy'.format(npys_output_folder, os.path.basename(predicted_dir), class_name, main_args.min_overlap), fppi)
+        np.save('{}/{}_{}_{}_fp.npy'.format(npys_output_folder, os.path.basename(predicted_dir), class_name, main_args.min_overlap), fp)
+        np.save('{}/{}_{}_{}_tp.npy'.format(npys_output_folder, os.path.basename(predicted_dir), class_name, main_args.min_overlap), tp)
+
+
+        print('lamr_dictionary', lamr_dictionary)
+
+        for i in range(10):
+            print('mr, fppi')
+            print(mr[i], fppi[i])
 
         """
          Draw plot
@@ -741,8 +898,13 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
           fig.savefig(results_files_path + "/classes/" + class_name + ".png")
           plt.cla() # clear axes for next plot
 
+          """
+          ROC Curve
+          """
+
           # print(len(fp),len(tp))
           plt.plot([0, 1], [0, 1], 'k--')
+          print(len(fp),len(tp))
           plt.plot(fp, tp)
           plt.xlabel('False positive rate')
           plt.ylabel('True positive rate')
@@ -751,12 +913,46 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
           fig.savefig(results_files_path + "/test_grv_" + class_name + ".png")
           plt.cla() # clear axes for next plot
 
+          """
+          Miss Rate vs FPPI curve
+          """
+          # n_fppi = np.insert(fppi, -1, 0)
+          # n_fppi = np.insert(n_fppi, -1, 0)
+          # print(len(fp),len(tp))
+          # plt.plot([0, 1], [0, 1], 'k--')
+          plt.plot(fppi, mr)
+          # plt.plot(fppi, ys_inverse)
+          plt.gca().set_xscale('log')
+          plt.grid()
+
+          plt.xlabel('False Positives Per Image')
+          plt.ylabel('Miss Rate')
+          plt.title('Miss Rate x FPPI curve')
+          plt.legend(loc='best')
+          fig.savefig(results_files_path + "/missrate-fppi_grv_" + class_name + ".png")
+          plt.cla() # clear axes for next plot
+
+
+
       if show_animation:
         cv2.destroyAllWindows()
 
       results_file.write("\n# mAP of all classes\n")
       mAP = sum_AP / n_classes
       text = "mAP = {0:.2f}%".format(mAP*100)
+      results_file.write(text + "\n")
+      print(text)
+
+      results_file.write("\n# wAP of all classes\n")
+      wAP = sum(wap_dictionary.values()) / gt_total
+      text = "wAP = {0:.2f}%".format(wAP*100)
+      results_file.write(text + "\n")
+      print(text)
+
+      results_file.write("\n# aAP of all classes\n")
+      # print('TP bboxes', sum(count_true_positives.values()))
+      aAP = sum(count_true_positives.values()) / gt_total
+      text = "aAP = {0:.2f}%".format(aAP*100)
       results_file.write(text + "\n")
       print(text)
 
@@ -768,22 +964,34 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
       #write global result
       with open(global_map_result_file_path, 'a') as global_f:
           ordered_ap_dictionary = OrderedDict(sorted(ap_dictionary.items()))
+          ordered_lamr_dictionary = OrderedDict(sorted(lamr_dictionary.items()))
           if first_inference:
               #write headers.
-              global_f.write("inference_dir;gt_dir;min_iou;epoch;mAP")
+              global_f.write("inference_dir;gt_dir;min_iou;epoch;mAP;wAP;aAP")
+
               for cl in ordered_ap_dictionary:
                   global_f.write(";{}".format(cl))
+
+              for cl in ordered_lamr_dictionary:
+                  global_f.write(";lamr-{}".format(cl))
+
               global_f.write("\n")
 
           #write scores.
-          global_f.write("{};{};{};{};{:.4f}".format(
+          global_f.write("{};{};{};{};{:.4f};{:.4f};{:.4f}".format(
             os.path.basename(main_args.inference_dir),
             os.path.basename(main_args.gt_dir if main_args.gt_dir else main_args.gt_annot),
             main_args.min_overlap,
             epoch,
-            mAP))
+            mAP,
+            wAP,
+            aAP))
           for cl in ordered_ap_dictionary:
               global_f.write(";{:.4f}".format(ordered_ap_dictionary[cl]))
+
+          for cl in ordered_lamr_dictionary:
+              global_f.write(";{:.4f}".format(ordered_lamr_dictionary[cl]))
+
           global_f.write("\n")
 
     shutil.rmtree(tmp_files_path)
@@ -808,7 +1016,7 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
         else:
           # if class didn't exist yet
           pred_counter_per_class[class_name] = 1
-    #print(pred_counter_per_class)
+    print('pred_counter_per_class', pred_counter_per_class)
     pred_classes = list(pred_counter_per_class.keys())
 
 
@@ -893,6 +1101,28 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
         results_file.write(text)
 
     """
+     Draw log-average miss rate plot (Show lamr of all classes in decreasing order)
+    """
+    if draw_plot:
+        window_title = "lamr"
+        plot_title = "log-average miss rate"
+        x_label = "log-average miss rate"
+        output_path = results_files_path + "/lamr.png"
+        to_show = False
+        plot_color = 'royalblue'
+        draw_plot_func(
+            lamr_dictionary,
+            n_classes,
+            window_title,
+            plot_title,
+            x_label,
+            output_path,
+            to_show,
+            plot_color,
+            ""
+            )
+
+    """
      Draw mAP plot (Show AP's of all classes in decreasing order)
     """
     if draw_plot:
@@ -917,13 +1147,12 @@ def eval_inference(no_animation=True, no_plot=True, quiet=True, ignore=None, set
     """
     Plot the histograms of bbox areas by GT and TP
     """
+    draw_plot = False
     if draw_plot:
         """
         Histogram: GT x TP
         This will reveal in which bbox sizes (areas) it is more problematic to detect.
         """
-        import numpy as np
-
         plt.title('GT x TP bbox areas. BINS=auto')
         plt.xlim(0, 60000)
         _, bins, _ = plt.hist(hist_gt_areas, bins='auto', label='GT {}'.format(len(hist_gt_areas)))
@@ -1171,9 +1400,6 @@ def convert_inference(annotation_file, type=None, overwrite=False):
     if type not in [PRED_TYPE, GT_TYPE]:
         raise Exception('Unknown type for convertion')
 
-    with open('extra/class_list_pti01v3.txt', 'r') as class_file:
-        class_map = class_file.readlines()
-
     if type==PRED_TYPE:
         folder_prefix = 'pred_{}'
         if main_args.canonical_bboxes:
@@ -1247,6 +1473,19 @@ if __name__ == '__main__':
     gt_annot_file = main_args.gt_annot if main_args.gt_annot else None
     gt_converted_dir = convert_inference(gt_annot_file , type='gt', overwrite=main_args.force_overwrite)
 
+    detranslation_dict = None
+    if main_args.detranslate_from:
+        detranslation_dict = {}
+        with open(main_args.detranslate_from, 'r') as annot_f:
+            for line in annot_f:
+                splitted = line.split(' ')
+                img_path = splitted[0].strip()
+                detranslation_dict[img_path] = []
+                for bbox in splitted[1:]:
+                    x_min, y_min, x_max, y_max, class_id = list(map(float, bbox.split(',')))
+                    detranslation_dict[img_path].append([x_min, y_min, x_max, y_max, class_id])
+
+
     first_inference = True
     for inference in inferences:
         print('For: ',os.path.basename(inference))
@@ -1258,6 +1497,7 @@ if __name__ == '__main__':
             no_plot=False,
             overwrite=main_args.force_overwrite,
             output_version=output_version,
-            first_inference=first_inference
+            first_inference=first_inference,
+            detranslation_dict=detranslation_dict,
             )
         first_inference = False
